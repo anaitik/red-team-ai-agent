@@ -4,6 +4,7 @@ import requests
 import base64
 import json
 import time
+import uuid
 from pathlib import Path
 from tenacity import RetryError, retry, wait_exponential, stop_after_attempt
 import os
@@ -105,6 +106,7 @@ h2, h3 {
 .badge-impact   { background: #cc00ff; color: #fff; }
 .badge-fix      { background: #00aaff; color: #fff; }
 .badge-retest   { background: #00cc66; color: #fff; }
+.badge-pr       { background: #2266ff; color: #fff; }
 .badge-running  { background: #ffcc00; color: #000; }
 
 /* Severity pills */
@@ -289,7 +291,81 @@ def get_github_contents(repo_url: str, token: str = "") -> dict:
     }
 
 
-def call_agent(client, model_name: str, system_prompt: str, user_prompt: str, delay: int = 15) -> str:
+def create_github_pr(owner: str, repo: str, token: str, new_files: dict, commit_msg: str, pr_title: str, pr_body: str) -> str:
+    """Create a new branch, commit modified files, and open a PR via GitHub API."""
+    if not token:
+        return "Error: GitHub token is required to create a Pull Request."
+        
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "Authorization": f"Bearer {token}",
+        "X-GitHub-Api-Version": "2022-11-28"
+    }
+    base_url = f"https://api.github.com/repos/{owner}/{repo}"
+    
+    # 1. Get default branch
+    r = requests.get(base_url, headers=headers, timeout=10)
+    if r.status_code != 200:
+        return f"Error getting repo info: {r.status_code}"
+    default_branch = r.json().get("default_branch", "main")
+    
+    # 2. Get default branch SHA
+    r = requests.get(f"{base_url}/git/ref/heads/{default_branch}", headers=headers, timeout=10)
+    if r.status_code != 200:
+        return f"Error getting base branch ref: {r.status_code}"
+    base_sha = r.json()["object"]["sha"]
+    
+    # 3. Create a tree with updated files
+    tree_elements = []
+    for path, content in new_files.items():
+        tree_elements.append({
+            "path": path,
+            "mode": "100644",
+            "type": "blob",
+            "content": content
+        })
+        
+    r = requests.post(f"{base_url}/git/trees", headers=headers, json={
+        "base_tree": base_sha,
+        "tree": tree_elements
+    }, timeout=15)
+    if r.status_code != 201:
+        return f"Error creating tree: {r.status_code} - {r.text}"
+    new_tree_sha = r.json()["sha"]
+    
+    # 4. Create commit
+    r = requests.post(f"{base_url}/git/commits", headers=headers, json={
+        "message": commit_msg,
+        "tree": new_tree_sha,
+        "parents": [base_sha]
+    }, timeout=10)
+    if r.status_code != 201:
+        return f"Error creating commit: {r.status_code}"
+    new_commit_sha = r.json()["sha"]
+    
+    # 5. Create new branch
+    new_branch = f"redteam-fix-{uuid.uuid4().hex[:6]}"
+    r = requests.post(f"{base_url}/git/refs", headers=headers, json={
+        "ref": f"refs/heads/{new_branch}",
+        "sha": new_commit_sha
+    }, timeout=10)
+    if r.status_code != 201:
+        return f"Error creating branch: {r.status_code}"
+        
+    # 6. Create PR
+    r = requests.post(f"{base_url}/pulls", headers=headers, json={
+        "title": pr_title,
+        "body": pr_body,
+        "head": new_branch,
+        "base": default_branch
+    }, timeout=10)
+    if r.status_code != 201:
+        return f"Error creating PR: {r.status_code} - {r.text}"
+        
+    return r.json().get("html_url", "Failed to retrieve PR URL")
+
+
+def call_agent(client, model_name: str, system_prompt: str, user_prompt: str, delay: int = 15, max_tokens: int = 500) -> str:
     """Single DeepSeek API call with aggressive rate limiting and retry logic."""
     time.sleep(delay)  # 15 second minimum gap for free tier
     
@@ -305,7 +381,7 @@ def call_agent(client, model_name: str, system_prompt: str, user_prompt: str, de
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt}
             ],
-            max_tokens=500,  # Aggressive reduction from 1000
+            max_tokens=max_tokens,  # Parameterized max_tokens
             temperature=0.5,  # Lower temp = cheaper
         )
         return response.choices[0].message.content
@@ -387,7 +463,7 @@ For each original vulnerability:
 - Recommendations for continuous security"""
 
 
-def run_red_team(client, model_name, repo_data: dict, manual_code: str, placeholder_dict: dict, progress_bar):
+def run_red_team(client, model_name, repo_data: dict, manual_code: str, placeholder_dict: dict, progress_bar, auto_pr: bool = False, github_token: str = ""):
     """Run streamlined agents with minimal API calls to respect free tier quotas."""
 
     # MINIMAL CONTEXT - Free tier must be highly aggressive
@@ -524,6 +600,69 @@ Format:
         results["retest"] = error_msg
         placeholder_dict["retest"].markdown(f'<div class="agent-card error"><span class="badge badge-retest">✗ ERROR</span><br>{str(e)[:100]}</div>', unsafe_allow_html=True)
 
+    # ── Agent 4: Auto PR
+    if auto_pr and repo_data and github_token:
+        progress_bar.progress(0.9, text="🚀 Generating Patch & PR...")
+        placeholder_dict["pr"].markdown(
+            f'<div class="agent-card active"><span class="badge badge-running">▶ RUNNING</span><br>'
+            f'<strong>🚀 Patch & PR</strong><br><em>Generating fixes...</em></div>',
+            unsafe_allow_html=True
+        )
+
+        pr_system = """You are the Auto-Patch Agent.
+Generate a valid JSON object containing full repaired code for affected files based on the suggested fixes. 
+Response MUST be valid JSON format:
+{
+  "files": [
+    {"path": "exact/file/path.py", "content": "full updated code including all original unmodified parts"}
+  ]
+}
+Return raw JSON ONLY. No markdown block backticks."""
+
+        pr_prompt = f"Original Files:\n{context}\n\nApply these fixes:\n{impact_fix_output[:500]}\n\nReturn JSON ONLY."
+
+        try:
+            pr_output = call_agent(client, model_name, pr_system, pr_prompt, delay=15, max_tokens=2500)
+            call_count += 1
+            
+            json_str = pr_output.strip()
+            if json_str.startswith("```json"): json_str = json_str[7:-3]
+            elif json_str.startswith("```"): json_str = json_str[3:-3]
+            
+            pr_data = json.loads(json_str)
+            new_files = {f["path"]: f["content"] for f in pr_data.get("files", [])}
+            
+            if new_files:
+                pr_url = create_github_pr(
+                    owner=repo_data["owner"], 
+                    repo=repo_data["repo"], 
+                    token=github_token, 
+                    new_files=new_files, 
+                    commit_msg="Auto-fix vulnerabilities from AI Red Team", 
+                    pr_title="🔴 AI Red Team: Vulnerability Auto-Fix", 
+                    pr_body="This PR contains automated security fixes generated by the AI Red Team System.\n\n### Fix Details\n" + impact_fix_output[:1000]
+                )
+                
+                if pr_url.startswith("http"):
+                    results["pr"] = f"✅ Pull Request Created: {pr_url}"
+                    placeholder_dict["pr"].markdown(f'<div class="agent-card done"><span class="badge badge-pr">✓ PR Created</span><br><a href="{pr_url}" target="_blank" style="color:#00ff88;">View Pull Request</a></div>', unsafe_allow_html=True)
+                else:
+                    results["pr"] = f"❌ PR Error: {pr_url}"
+                    placeholder_dict["pr"].markdown(f'<div class="agent-card error"><span class="badge badge-pr">✗ ERROR</span><br>{pr_url}</div>', unsafe_allow_html=True)
+            else:
+                results["pr"] = "❌ Failed to generate any file changes."
+                placeholder_dict["pr"].markdown(f'<div class="agent-card error"><span class="badge badge-pr">✗ ERROR</span><br>No valid changes generated.</div>', unsafe_allow_html=True)
+                
+        except Exception as e:
+            results["pr"] = f"❌ PR Error: {str(e)}"
+            placeholder_dict["pr"].markdown(f'<div class="agent-card error"><span class="badge badge-pr">✗ ERROR</span><br>{str(e)[:100]}</div>', unsafe_allow_html=True)
+            
+    elif auto_pr:
+        placeholder_dict["pr"].markdown(f'<div class="agent-card error"><span class="badge badge-pr">✗ SKIPPED</span><br>Missing GitHub token or repo context.</div>', unsafe_allow_html=True)
+    else:
+        results["pr"] = "Auto PR disabled."
+        placeholder_dict["pr"].markdown(f'<div class="agent-card done"><span class="badge badge-pr">✓ SKIPPED</span><br>Auto PR disabled.</div>', unsafe_allow_html=True)
+
     progress_bar.progress(1.0, text=f"✅ Complete ({call_count} API calls)")
     return results
 
@@ -551,9 +690,11 @@ with st.sidebar:
     target_mode = st.selectbox("Input Mode", ["GitHub Repository", "Paste Code"])
 
     github_token = ""
+    auto_pr = False
     if target_mode == "GitHub Repository":
-        github_token = st.text_input("GitHub Token (optional)", type="password",
-                                     placeholder="ghp_... (for private repos)")
+        github_token = st.text_input("GitHub Token (optional for scan, REQUIRED for PR)", type="password",
+                                     placeholder="ghp_...")
+        auto_pr = st.checkbox("Auto-Create Pull Request for fixes")
 
     st.markdown("---")
     st.markdown("### ⚙️ Scan Options")
@@ -629,13 +770,14 @@ st.markdown("---")
 
 st.markdown("### 🤖 Agent Pipeline")
 
-pipeline_cols = st.columns(5)
+pipeline_cols = st.columns(6)
 labels = [
     ("⚔️", "Attack\nGenerator", "attack"),
     ("🔍", "Exploit\nFinder", "exploit"),
     ("💥", "Impact\nAnalyzer", "impact"),
     ("🛠️", "Fix\nSuggestion", "fix"),
     ("🔄", "Re-Test\nAgent", "retest"),
+    ("🚀", "Patch &\nPR", "pr"),
 ]
 for col, (icon, label, _) in zip(pipeline_cols, labels):
     with col:
@@ -661,10 +803,11 @@ with results_area:
     ph_impact  = st.empty()
     ph_fix     = st.empty()
     ph_retest  = st.empty()
+    ph_pr      = st.empty()
 
 # Idle state
 for ph, (icon, label, badge) in zip(
-    [ph_attack, ph_exploit, ph_impact, ph_fix, ph_retest], labels
+    [ph_attack, ph_exploit, ph_impact, ph_fix, ph_retest, ph_pr], labels
 ):
     ph.markdown(
         f'<div class="agent-card"><span class="badge badge-{badge}" '
@@ -716,10 +859,11 @@ if run_btn:
         "impact":  ph_impact,
         "fix":     ph_fix,
         "retest":  ph_retest,
+        "pr":      ph_pr,
     }
 
     final_results = run_red_team(
-        client, model, repo_data, manual_code, placeholder_dict, progress
+        client, model, repo_data, manual_code, placeholder_dict, progress, auto_pr, github_token
     )
 
     # ── Summary Metrics ───────────────────────────────────────────────────────
@@ -767,6 +911,12 @@ Generated by AI Red Team Agent
 ---
 
 {final_results.get('retest', '')}
+
+---
+
+## Auto-Patch & PR
+
+{final_results.get('pr', '')}
 """
     st.download_button(
         "📥 Download Full Report (Markdown)",
