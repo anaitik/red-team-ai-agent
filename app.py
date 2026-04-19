@@ -544,10 +544,7 @@ with st.sidebar:
     </div>
     """, unsafe_allow_html=True)
 
-    st.markdown("### 🔑 API Configuration")
-    api_key_default = os.getenv("DEEPSEEK_API_KEY", "")
-    api_key = st.text_input("DeepSeek API Key", type="password",
-                            value=api_key_default, key="api_key")
+    api_key = os.getenv("DEEPSEEK_API_KEY", "")
 
     st.markdown("---")
     st.markdown("### 📁 Target")
@@ -681,7 +678,7 @@ for ph, (icon, label, badge) in zip(
 
 if run_btn:
     if not api_key:
-        st.error("⚠️ Please enter your DeepSeek API key in the sidebar.")
+        st.error("⚠️ Please set your DEEPSEEK_API_KEY in the .env file.")
         st.stop()
 
     if target_mode == "GitHub Repository" and not repo_url:
