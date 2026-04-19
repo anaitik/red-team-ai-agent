@@ -1,11 +1,15 @@
 import streamlit as st
-import google.generativeai as genai
+from openai import OpenAI
 import requests
 import base64
 import json
 import time
 from pathlib import Path
-from tenacity import retry, wait_exponential, stop_after_attempt
+from tenacity import RetryError, retry, wait_exponential, stop_after_attempt
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # ── Page config ──────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -285,29 +289,36 @@ def get_github_contents(repo_url: str, token: str = "") -> dict:
     }
 
 
-def call_agent(model, system_prompt: str, user_prompt: str, delay: int = 15) -> str:
-    """Single Gemini API call with aggressive rate limiting and retry logic."""
+def call_agent(client, model_name: str, system_prompt: str, user_prompt: str, delay: int = 15) -> str:
+    """Single DeepSeek API call with aggressive rate limiting and retry logic."""
     time.sleep(delay)  # 15 second minimum gap for free tier
     
     @retry(
         wait=wait_exponential(multiplier=2, min=10, max=60),
         stop=stop_after_attempt(2),  # Reduced retries
+        reraise=True,
     )
     def _call():
-        combined_prompt = f"{system_prompt}\n\n{user_prompt}"
-        response = model.generate_content(
-            combined_prompt,
-            generation_config=genai.types.GenerationConfig(
-                max_output_tokens=500,  # Aggressive reduction from 1000
-                temperature=0.5,  # Lower temp = cheaper
-            )
+        response = client.chat.completions.create(
+            model=model_name,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            max_tokens=500,  # Aggressive reduction from 1000
+            temperature=0.5,  # Lower temp = cheaper
         )
-        return response.text
+        return response.choices[0].message.content
     
     try:
         return _call()
+    except RetryError as e:
+        last_exception = e.last_attempt.exception()
+        if last_exception is not None:
+            return f"Error: {type(last_exception).__name__}: {str(last_exception)}"
+        return f"Error: {type(e).__name__}: {str(e)}"
     except Exception as e:
-        return f"Error: {str(e)}"
+        return f"Error: {type(e).__name__}: {str(e)}"
 
 
 # ── Agent prompts ─────────────────────────────────────────────────────────────
@@ -376,16 +387,16 @@ For each original vulnerability:
 - Recommendations for continuous security"""
 
 
-def run_red_team(model, repo_data: dict, manual_code: str, placeholder_dict: dict, progress_bar):
+def run_red_team(client, model_name, repo_data: dict, manual_code: str, placeholder_dict: dict, progress_bar):
     """Run streamlined agents with minimal API calls to respect free tier quotas."""
 
     # MINIMAL CONTEXT - Free tier must be highly aggressive
     if repo_data and "file_contents" in repo_data:
-        # Only top 3 most important files
-        tree_str = "\n".join(repo_data.get("file_tree", [])[:20])
+        # Only top 2 most important files to limit prompt size
+        tree_str = "\n".join(repo_data.get("file_tree", [])[:15])
         files_str = "\n\n".join(
-            [f"### {path}\n```\n{content[:800]}\n```"
-             for path, content in list(repo_data["file_contents"].items())[:3]]
+            [f"### {path}\n```\n{content[:400]}\n```"
+             for path, content in list(repo_data["file_contents"].items())[:2]]
         )
         context = f"Repo: {repo_data['owner']}/{repo_data['repo']}\n\nFiles:\n{files_str}"
     else:
@@ -415,7 +426,7 @@ Format:
     attack_prompt = f"Analyze this codebase for vulnerabilities:\n\n{context}\n\nBe concise. Only list REAL exploitable issues."
     
     try:
-        attack_exploit_output = call_agent(model, combined_system, attack_prompt)
+        attack_exploit_output = call_agent(client, model_name, combined_system, attack_prompt)
         results["attack"] = attack_exploit_output
         results["exploit"] = attack_exploit_output
         call_count += 1
@@ -460,7 +471,7 @@ Format:
     impact_prompt = f"For these vulnerabilities:\n\n{attack_exploit_output[:600]}\n\nProvide impact and fixes. Be extremely concise."
     
     try:
-        impact_fix_output = call_agent(model, combined_system2, impact_prompt, delay=15)
+        impact_fix_output = call_agent(client, model_name, combined_system2, impact_prompt, delay=15)
         results["impact"] = impact_fix_output
         results["fix"] = impact_fix_output
         call_count += 1
@@ -499,7 +510,7 @@ Format:
     retest_prompt = f"Fixes:\n{impact_fix_output[:400]}\n\nAgainst:\n{attack_exploit_output[:400]}\n\nVerify status."
     
     try:
-        retest_output = call_agent(model, retest_system, retest_prompt, delay=15)
+        retest_output = call_agent(client, model_name, retest_system, retest_prompt, delay=15)
         results["retest"] = retest_output
         call_count += 1
         
@@ -534,8 +545,9 @@ with st.sidebar:
     """, unsafe_allow_html=True)
 
     st.markdown("### 🔑 API Configuration")
-    api_key = st.text_input("Gemini API Key", type="password",
-                            placeholder="AIza...", key="api_key")
+    api_key_default = os.getenv("DEEPSEEK_API_KEY", "")
+    api_key = st.text_input("DeepSeek API Key", type="password",
+                            value=api_key_default, key="api_key")
 
     st.markdown("---")
     st.markdown("### 📁 Target")
@@ -555,12 +567,12 @@ with st.sidebar:
                            default=["Injection", "Auth/AuthZ", "Secrets"])
 
     st.markdown("---")
-    st.warning("⚠️ **FREE TIER NOTICE**: Gemini free tier has strict quotas (50 req/min). Using 3 combined API calls instead of 5 to stay within limits. For unlimited access, upgrade to a paid plan.", icon="⚠️")
+    st.warning("⚠️ **FREE TIER NOTICE**: DeepSeek free tier has strict quotas (50 req/min). Using 3 combined API calls instead of 5 to stay within limits. For unlimited access, upgrade to a paid plan.", icon="⚠️")
     
     st.markdown("""
     <div style='font-family: Share Tech Mono, monospace; color: #444; font-size: 10px; text-align:center;'>
         AI Red Team Agent v2.0<br>
-        Powered by Google Gemini (Free Tier Optimized)<br>
+        Powered by DeepSeek (Free Tier Optimized)<br>
         3 Parallel Agent Combos · Max 3 API Calls
     </div>
     """, unsafe_allow_html=True)
@@ -669,7 +681,7 @@ for ph, (icon, label, badge) in zip(
 
 if run_btn:
     if not api_key:
-        st.error("⚠️ Please enter your Gemini API key in the sidebar.")
+        st.error("⚠️ Please enter your DeepSeek API key in the sidebar.")
         st.stop()
 
     if target_mode == "GitHub Repository" and not repo_url:
@@ -680,8 +692,11 @@ if run_btn:
         st.error("⚠️ Please paste some code to analyze.")
         st.stop()
 
-    genai.configure(api_key=api_key)
-    model = genai.GenerativeModel('gemini-2.0-flash')
+    client = OpenAI(
+        api_key=api_key,
+        base_url="https://api.deepseek.com"
+    )
+    model = "deepseek-chat"
 
     repo_data = None
     if target_mode == "GitHub Repository":
@@ -707,7 +722,7 @@ if run_btn:
     }
 
     final_results = run_red_team(
-        model, repo_data, manual_code, placeholder_dict, progress
+        client, model, repo_data, manual_code, placeholder_dict, progress
     )
 
     # ── Summary Metrics ───────────────────────────────────────────────────────
